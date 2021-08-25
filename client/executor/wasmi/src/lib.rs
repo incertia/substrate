@@ -46,7 +46,7 @@ struct FunctionExecutor {
 }
 
 struct Inner {
-	sandbox_store: RefCell<sandbox::Store<wasmi::FuncRef>>,
+	sandbox_store: RefCell<sandbox::Store<DispatchThunk>>,
 	heap: RefCell<sc_allocator::FreeingBumpHeapAllocator>,
 	memory: MemoryRef,
 	table: Option<TableRef>,
@@ -78,27 +78,29 @@ impl FunctionExecutor {
 	}
 }
 
-impl sandbox::SandboxCapabilities for FunctionExecutor {
-	type SupervisorFuncRef = wasmi::FuncRef;
+#[derive(Clone)]
+struct DispatchThunk(wasmi::FuncRef);
 
+impl sandbox::DispatchThunk for DispatchThunk {
 	fn invoke(
-		&mut self,
-		dispatch_thunk: &Self::SupervisorFuncRef,
+		&self,
 		invoke_args_ptr: Pointer<u8>,
 		invoke_args_len: WordSize,
 		state: u32,
 		func_idx: sandbox::SupervisorFuncIndex,
+		supervisor_context: &mut FunctionContext,
 	) -> Result<i64, Error> {
 		let result = wasmi::FuncInstance::invoke(
-			dispatch_thunk,
+			&self.0,
 			&[
 				RuntimeValue::I32(u32::from(invoke_args_ptr) as i32),
 				RuntimeValue::I32(invoke_args_len as i32),
 				RuntimeValue::I32(state as i32),
 				RuntimeValue::I32(usize::from(func_idx) as i32),
 			],
-			self,
+			supervisor_context,
 		);
+
 		match result {
 			Ok(Some(RuntimeValue::I64(val))) => Ok(val),
 			Ok(_) => return Err("Supervisor function returned unexpected result!".into()),
@@ -225,10 +227,7 @@ impl Sandbox for FunctionExecutor {
 			.instance(instance_id)
 			.map_err(|e| e.to_string())?;
 
-		let result = EXECUTOR
-			.set(self, || instance.invoke::<_, CapsHolder, ThunkHolder>(export_name, &args, state));
-
-		match result {
+		match instance.invoke(export_name, &args, state, self) {
 			Ok(None) => Ok(sandbox_primitives::ERR_OK),
 			Ok(Some(val)) => {
 				// Serialize return value and write it back into the memory.
@@ -281,11 +280,7 @@ impl Sandbox for FunctionExecutor {
 		};
 
 		let store = &mut *self.inner.sandbox_store.borrow_mut();
-		let result = EXECUTOR.set(self, || {
-			DISPATCH_THUNK.set(&dispatch_thunk, || {
-				store.instantiate::<_, CapsHolder, ThunkHolder>(wasm, guest_env, state)
-			})
-		});
+		let result = store.instantiate(wasm, guest_env, state, dispatch_thunk, self);
 
 		let instance_idx_or_err_code: u32 = match result.map(|i| i.register(store)) {
 			Ok(instance_idx) => instance_idx,
@@ -307,48 +302,6 @@ impl Sandbox for FunctionExecutor {
 			.instance(instance_idx)
 			.map(|i| i.get_global_val(name))
 			.map_err(|e| e.to_string())
-	}
-}
-
-/// Wasmi specific implementation of `SandboxCapabilitiesHolder` that provides
-/// sandbox with a scoped thread local access to a function executor.
-/// This is a way to calm down the borrow checker since host function closures
-/// require exclusive access to it.
-struct CapsHolder;
-
-scoped_tls::scoped_thread_local!(static EXECUTOR: FunctionExecutor);
-
-impl sandbox::SandboxCapabilitiesHolder for CapsHolder {
-	type SupervisorFuncRef = wasmi::FuncRef;
-	type SC = FunctionExecutor;
-
-	fn with_sandbox_capabilities<R, F: FnOnce(&mut Self::SC) -> R>(f: F) -> R {
-		assert!(EXECUTOR.is_set(), "wasmi executor is not set");
-		EXECUTOR.with(|executor| f(&mut executor.clone()))
-	}
-}
-
-/// Wasmi specific implementation of `DispatchThunkHolder` that provides
-/// sandbox with a scoped thread local access to a dispatch thunk.
-/// This is a way to calm down the borrow checker since host function closures
-/// require exclusive access to it.
-struct ThunkHolder;
-
-scoped_tls::scoped_thread_local!(static DISPATCH_THUNK: wasmi::FuncRef);
-
-impl sandbox::DispatchThunkHolder for ThunkHolder {
-	type DispatchThunk = wasmi::FuncRef;
-
-	fn with_dispatch_thunk<R, F: FnOnce(&mut Self::DispatchThunk) -> R>(f: F) -> R {
-		assert!(DISPATCH_THUNK.is_set(), "dispatch thunk is not set");
-		DISPATCH_THUNK.with(|thunk| f(&mut thunk.clone()))
-	}
-
-	fn initialize_thunk<R, F>(s: &Self::DispatchThunk, f: F) -> R
-	where
-		F: FnOnce() -> R,
-	{
-		DISPATCH_THUNK.set(s, f)
 	}
 }
 
